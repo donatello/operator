@@ -104,17 +104,13 @@ func (ls *LogSearch) ingestHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = ls.DBClient.InsertAuditLog(context.Background(), ts, string(buf))
+	err = ls.DBClient.InsertEvent(context.Background(), ts, string(buf))
 	if err != nil {
 		ls.writeErrorResponse(w, 500, "Error writing to DB", err)
-		return
 	}
-
-	return
 }
 
 func (ls *LogSearch) queryHandler(w http.ResponseWriter, r *http.Request) {
-	return
 }
 
 // debug helper
@@ -133,7 +129,7 @@ func printReq(r *http.Request) error {
 
 	var out bytes.Buffer
 	json.Indent(&out, buf, "", "  ")
-	fmt.Println(string(out.Bytes()))
+	fmt.Println(out.String())
 
 	newBuf := bytes.NewBuffer(buf)
 	r.Body = ioutil.NopCloser(newBuf)

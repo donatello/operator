@@ -10,25 +10,63 @@ import (
 )
 
 const (
-	auditLogEventsTable = "audit_log_events"
-)
-
-const (
-	createAuditLogEventsTable = `CREATE TABLE %s (
-                                       event_time TIMESTAMPTZ NOT NULL,
-                                       log JSONB NOT NULL
-                                     ) PARTITION BY RANGE (event_time);`
-	createTablePartition = `CREATE TABLE %s PARTITION OF %s
-                                  FOR VALUES FROM ('%s') TO ('%s');`
+	createTablePartition QTemplate = `CREATE TABLE %s PARTITION OF %s
+                                            FOR VALUES FROM ('%s') TO ('%s');`
 )
 
 const (
 	partitionsPerMonth = 4
 )
 
-func mkQuery(qTemplate string, args ...interface{}) string {
-	return fmt.Sprintf(qTemplate, args...)
+// QTemplate is used to represent queries that involve string substitution as
+// well as SQL positional argument substitution.
+type QTemplate string
+
+func (t QTemplate) build(args ...interface{}) string {
+	return fmt.Sprintf(string(t), args...)
 }
+
+// Table a database table
+type Table struct {
+	Name            string
+	CreateStatement QTemplate
+}
+
+func (t *Table) getCreateStatement() string {
+	return t.CreateStatement.build(t.Name)
+}
+
+func (t *Table) getCreatePartitionStatement(partitionNameSuffix, rangeStart, rangeEnd string) string {
+	partitionName := fmt.Sprintf("%s_%s", t.Name, partitionNameSuffix)
+	return createTablePartition.build(partitionName, t.Name, rangeStart, rangeEnd)
+}
+
+var (
+	auditLogEventsTable = Table{
+		Name: "audit_log_events",
+		CreateStatement: `CREATE TABLE %s (
+                                    event_time TIMESTAMPTZ NOT NULL,
+                                    log JSONB NOT NULL
+                                  ) PARTITION BY RANGE (event_time);`,
+	}
+	requestInfoTable = Table{
+		Name: "request_info",
+		CreateStatement: `CREATE TABLE %s (
+                                    time TIMESTAMPTZ NOT NULL,
+                                    api_name TEXT NOT NULL,
+                                    bucket TEXT,
+                                    object TEXT,
+                                    time_to_response_ns INT8,
+                                    remote_host TEXT,
+                                    request_id TEXT,
+                                    user_agent TEXT,
+                                    response_status TEXT,
+                                    response_status_code INT8,
+                                    request_content_length INT8,
+                                    response_content_length INT8
+                                  ) PARTITION BY RANGE (time);`,
+	}
+)
 
 func getPartitionRange(t time.Time) (time.Time, time.Time) {
 	// Zero out the time and use UTC
@@ -51,10 +89,12 @@ func getPartitionRange(t time.Time) (time.Time, time.Time) {
 	}
 }
 
+// DBClient is a client object that makes requests to the DB.
 type DBClient struct {
 	*pgxpool.Pool
 }
 
+// NewDBClient creates a new DBClient.
 func NewDBClient(ctx context.Context, connStr string) (*DBClient, error) {
 	pool, err := pgxpool.Connect(ctx, connStr)
 	if err != nil {
@@ -67,7 +107,8 @@ func (c *DBClient) checkTableExists(ctx context.Context, table string) (bool, er
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	res, _ := c.Query(ctx, mkQuery(`SELECT 1 FROM %s WHERE false;`, table))
+	const existsQuery QTemplate = `SELECT 1 FROM %s WHERE false;`
+	res, _ := c.Query(ctx, existsQuery.build(table))
 	if res.Err() != nil {
 		if strings.Contains(res.Err().Error(), "(SQLSTATE 42P01)") {
 			return false, nil
@@ -77,38 +118,51 @@ func (c *DBClient) checkTableExists(ctx context.Context, table string) (bool, er
 	return true, nil
 }
 
-// Create tables
-func (c *DBClient) InitDBTables(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	if exists, err := c.checkTableExists(ctx, auditLogEventsTable); err != nil {
+func (c *DBClient) createTableAndPartition(ctx context.Context, table Table) error {
+	if exists, err := c.checkTableExists(ctx, table.Name); err != nil {
 		return err
 	} else if exists {
 		return nil
 	}
 
-	// Create all initial tables
-	if _, err := c.Exec(ctx, mkQuery(createAuditLogEventsTable, auditLogEventsTable)); err != nil {
+	if _, err := c.Exec(ctx, table.getCreateStatement()); err != nil {
 		return err
 	}
 
 	start, end := getPartitionRange(time.Now())
-	tableName := fmt.Sprintf("%s_%s", auditLogEventsTable, start.Format("2006_01_02"))
+	partSuffix := start.Format("2006_01_02")
 	rangeStart, rangeEnd := start.Format("2006-01-02"), end.Format("2006-01-02")
-	if _, err := c.Exec(ctx, mkQuery(createTablePartition, tableName, auditLogEventsTable, rangeStart, rangeEnd)); err != nil {
+	_, err := c.Exec(ctx, table.getCreatePartitionStatement(partSuffix, rangeStart, rangeEnd))
+	return err
+}
+
+func (c *DBClient) createTables(ctx context.Context) error {
+	if err := c.createTableAndPartition(ctx, auditLogEventsTable); err != nil {
 		return err
 	}
+
+	if err := c.createTableAndPartition(ctx, requestInfoTable); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func (c *DBClient) InsertAuditLog(ctx context.Context, eventTime time.Time, logData string) error {
+// InitDBTables Creates tables in the DB.
+func (c *DBClient) InitDBTables(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	const insertAuditLogEvent = `INSERT INTO %s (event_time, log) VALUES ($1, $2);`
+	return c.createTables(ctx)
+}
 
-	_, err := c.Exec(ctx, mkQuery(insertAuditLogEvent, auditLogEventsTable), eventTime, logData)
+// InsertEvent inserts audit event in the DB.
+func (c *DBClient) InsertEvent(ctx context.Context, eventTime time.Time, logData string) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	const insertAuditLogEvent QTemplate = `INSERT INTO %s (event_time, log) VALUES ($1, $2);`
+	_, err := c.Exec(ctx, insertAuditLogEvent.build(auditLogEventsTable.Name), eventTime, logData)
 	if err != nil {
 		return err
 	}
